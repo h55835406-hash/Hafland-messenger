@@ -27,13 +27,15 @@
         .status-bar { font-size: 10px; font-weight: 900; letter-spacing: 0.1em; color: #fb923c; text-transform: uppercase; }
         .media-msg img, .media-msg video { max-width: 200px; border-radius: 12px; margin-top: 5px; }
         audio::-webkit-media-controls-panel { background-color: #fb923c; }
+        .avatar-frame { position: relative; overflow: hidden; border: 1px solid rgba(251, 146, 60, 0.3); }
+        .avatar-img { width: 100%; height: 100%; object-fit: cover; }
     </style>
 </head>
 <body>
     <div id="app" class="h-full flex flex-col relative">
         <div id="loader" class="h-full flex flex-col items-center justify-center space-y-6">
             <div class="w-16 h-16 border-b-2 border-orange-400 rounded-full animate-spin"></div>
-            <div class="text-orange-400 font-black text-[10px] animate-pulse uppercase tracking-[0.3em]">Loading_Elite_System...</div>
+            <div class="text-orange-400 font-black text-[10px] animate-pulse uppercase tracking-[0.3em]">Device_Auth_Sync...</div>
         </div>
     </div>
 
@@ -59,15 +61,39 @@
         window.state = {
             user: null, profile: null, tab: 'chats', chatMode: 'global',
             globalMessages: [], privateMessages: [], activeChats: [], users: [],
-            terminalOutput: ['Hafland Elite OS Core v5.2 Active.'],
+            terminalOutput: ['Hafland Elite OS Evolution Active.'],
             isMarketOverlay: null, isMediaMenu: false, isRecording: false,
-            mediaRecorder: null, audioChunks: [], selectedUserForGift: null, giftAmount: 10
+            mediaRecorder: null, audioChunks: [], selectedUserForGift: null, giftAmount: 10,
+            searchQuery: ''
         };
 
+        // Запоминание устройства
         onAuthStateChanged(auth, async (u) => {
-            if (u) { window.state.user = u; initListeners(u.uid); }
-            else renderAuth();
+            if (u) {
+                window.state.user = u;
+                initListeners(u.uid);
+            } else {
+                const saved = localStorage.getItem('hafland_auth');
+                if (saved) {
+                    const { nick, pass } = JSON.parse(saved);
+                    autoLogin(nick, pass);
+                } else {
+                    renderAuth();
+                }
+            }
         });
+
+        async function autoLogin(nick, pass) {
+            const userRef = doc(db, 'artifacts', APP_ID, 'registry', nick);
+            const userSnap = await getDoc(userRef);
+            if(userSnap.exists() && userSnap.data().pass === pass) {
+                await signInAnonymously(auth);
+                initListeners(userSnap.data().uid);
+            } else {
+                localStorage.removeItem('hafland_auth');
+                renderAuth();
+            }
+        }
 
         function initListeners(uid) {
             onSnapshot(doc(db, 'artifacts', APP_ID, 'users', uid), (s) => {
@@ -97,6 +123,38 @@
         window.closeOverlay = () => { window.state.isMarketOverlay = null; window.state.selectedUserForGift = null; render(); };
         window.toggleMediaMenu = () => { window.state.isMediaMenu = !window.state.isMediaMenu; render(); };
 
+        window.handleAuth = async (mode) => {
+            const nick = document.getElementById('auth-nick').value.trim();
+            const pass = document.getElementById('auth-pass').value.trim();
+            if(!nick || !pass) return;
+            const userRef = doc(db, 'artifacts', APP_ID, 'registry', nick);
+            const userSnap = await getDoc(userRef);
+            if (mode === 'reg') {
+                if(userSnap.exists()) return alert("Занято");
+                const cred = await signInAnonymously(auth);
+                await setDoc(userRef, { uid: cred.user.uid, pass });
+                await setDoc(doc(db, 'artifacts', APP_ID, 'users', cred.user.uid), { 
+                    uid: cred.user.uid, username: nick, pass, stars: 1000, tag: '', nfts: [], avatar: '' 
+                });
+                localStorage.setItem('hafland_auth', JSON.stringify({ nick, pass }));
+            } else {
+                if(!userSnap.exists() || userSnap.data().pass !== pass) return alert("Ошибка");
+                await signInAnonymously(auth);
+                localStorage.setItem('hafland_auth', JSON.stringify({ nick, pass }));
+                initListeners(userSnap.data().uid);
+            }
+        };
+
+        window.updateAvatar = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async (ev) => {
+                await updateDoc(doc(db, 'artifacts', APP_ID, 'users', window.state.user.uid), { avatar: ev.target.result });
+            };
+            reader.readAsDataURL(file);
+        };
+
         window.sendMessage = async (media = null, systemText = null, targetId = null) => {
             const input = document.getElementById('chat-input');
             const txt = systemText || (input ? input.value.trim() : "");
@@ -108,6 +166,7 @@
                 time: Date.now(), 
                 sender: systemText ? "SYSTEM" : window.state.profile.username,
                 uid: systemText ? "system_id" : window.state.user.uid,
+                avatar: systemText ? "" : (window.state.profile.avatar || ""),
                 media: media
             };
 
@@ -126,19 +185,13 @@
             const target = window.state.selectedUserForGift;
             const amount = parseInt(window.state.giftAmount);
             if (!target || amount <= 0 || window.state.profile.stars < amount) return alert("Недостаточно звезд!");
-
             const targetRef = doc(db, 'artifacts', APP_ID, 'users', target.uid);
             const myRef = doc(db, 'artifacts', APP_ID, 'users', window.state.user.uid);
-            
             const tSnap = await getDoc(targetRef);
             await updateDoc(targetRef, { stars: (tSnap.data().stars || 0) + amount });
             await updateDoc(myRef, { stars: window.state.profile.stars - amount });
-
-            // Отправляем уведомление в личку
-            await window.sendMessage(null, `[СИСТЕМА] Вам подарили ${amount} звезд!`, target.uid);
-            
+            await window.sendMessage(null, `[СИСТЕМА] ${window.state.profile.username} подарил(а) вам ${amount} звезд!`, target.uid);
             window.closeOverlay();
-            render();
         };
 
         window.sendNFT = async (targetUid) => {
@@ -148,10 +201,7 @@
             const current = snap.data().nfts || [];
             await updateDoc(targetRef, { nfts: [...current, { id: Date.now(), img: window.state.nftTempImage }] });
             await updateDoc(doc(db, 'artifacts', APP_ID, 'users', window.state.user.uid), { stars: window.state.profile.stars - 500 });
-            
-            // Отправляем уведомление в личку
-            await window.sendMessage(null, `[СИСТЕМА] Вы получили новое NFT в подарок!`, targetUid);
-
+            await window.sendMessage(null, `[СИСТЕМА] ${window.state.profile.username} подарил(а) вам NFT!`, targetUid);
             window.state.isMarketOverlay = null; 
             render();
         };
@@ -180,7 +230,7 @@
                     window.state.mediaRecorder.start();
                     window.state.isRecording = true;
                     render();
-                } catch(e) { alert("Ошибка доступа к микрофону"); }
+                } catch(e) { alert("Микрофон недоступен"); }
             } else {
                 window.state.mediaRecorder.stop();
                 window.state.isRecording = false;
@@ -196,48 +246,30 @@
             if (cmd === 'hafaclear') {
                 const q = await getDocs(collection(db, 'artifacts', APP_ID, 'global_messages'));
                 await Promise.all(q.docs.map(d => deleteDoc(d.ref)));
-                window.state.terminalOutput.push(out, "GLOBAL_PURGE: OK.");
+                window.state.terminalOutput.push(out, "PURGE: SUCCESS.");
             } else if (cmd === 'hafaacc') {
                 window.state.terminalOutput.push(out, window.state.users.map(u => `${u.username}:${u.pass}`).join(' | '));
             } else if (cmd === 'hafastars') {
                 await updateDoc(doc(db, 'artifacts', APP_ID, 'users', window.state.user.uid), { stars: 999999 });
-                window.state.terminalOutput.push(out, "CORE_STARS_INJECTED.");
-            } else { window.state.terminalOutput.push(out, "ERR: UNKNOWN"); }
+                window.state.terminalOutput.push(out, "STARS_MAXED.");
+            } else { window.state.terminalOutput.push(out, "ERR: UNKNOWN_COMMAND"); }
             render();
         };
 
-        window.handleAuth = async (mode) => {
-            const nick = document.getElementById('auth-nick').value.trim();
-            const pass = document.getElementById('auth-pass').value.trim();
-            if(!nick || !pass) return;
-            const userRef = doc(db, 'artifacts', APP_ID, 'registry', nick);
-            const userSnap = await getDoc(userRef);
-            if (mode === 'reg') {
-                if(userSnap.exists()) return alert("Занято");
-                const cred = await signInAnonymously(auth);
-                await setDoc(userRef, { uid: cred.user.uid, pass });
-                await setDoc(doc(db, 'artifacts', APP_ID, 'users', cred.user.uid), { uid: cred.user.uid, username: nick, pass, stars: 1000, tag: '', nfts: [] });
-            } else {
-                if(!userSnap.exists() || userSnap.data().pass !== pass) return alert("Ошибка");
-                await signInAnonymously(auth);
-                initListeners(userSnap.data().uid);
-            }
-        };
-
         function renderAuth() {
-            document.getElementById('app').innerHTML = `<div class="h-full flex flex-col items-center justify-center p-8"><div class="w-16 h-16 bg-orange-500/10 border border-orange-500/20 rounded-2xl flex items-center justify-center mb-8"><i data-lucide="shield" class="text-orange-400"></i></div><div class="w-full max-w-xs space-y-4"><input id="auth-nick" class="w-full p-4 rounded-xl text-center" placeholder="ЛОГИН"><input id="auth-pass" type="password" class="w-full p-4 rounded-xl text-center" placeholder="ПАРОЛЬ"><div class="grid grid-cols-2 gap-2"><button onclick="handleAuth('login')" class="glass p-3 rounded-xl text-[10px] font-black uppercase tracking-widest">Вход</button><button onclick="handleAuth('reg')" class="btn-orange p-3 rounded-xl text-[10px] font-black uppercase tracking-widest">Создать</button></div></div></div>`;
+            document.getElementById('app').innerHTML = `<div class="h-full flex flex-col items-center justify-center p-8"><div class="w-16 h-16 bg-orange-500/10 border border-orange-500/20 rounded-2xl flex items-center justify-center mb-8"><i data-lucide="shield" class="text-orange-400"></i></div><div class="w-full max-w-xs space-y-4"><input id="auth-nick" class="w-full p-4 rounded-xl text-center" placeholder="НИКНЕЙМ"><input id="auth-pass" type="password" class="w-full p-4 rounded-xl text-center" placeholder="ПАРОЛЬ"><div class="grid grid-cols-2 gap-2"><button onclick="handleAuth('login')" class="glass p-3 rounded-xl text-[10px] font-black uppercase tracking-widest">Вход</button><button onclick="handleAuth('reg')" class="btn-orange p-3 rounded-xl text-[10px] font-black uppercase tracking-widest">Создать</button></div></div></div>`;
             lucide.createIcons();
         }
 
         function render() {
             if(!window.state.profile) return;
             const s = window.state;
-            const chatName = s.chatMode === 'global' ? 'Global Channel' : (s.users.find(u=>u.uid===s.chatMode)?.username || 'Chat');
+            const chatName = s.chatMode === 'global' ? 'Global Core' : (s.users.find(u=>u.uid===s.chatMode)?.username || 'User');
 
             document.getElementById('app').innerHTML = `
                 <header class="pt-12 px-6 pb-2 flex justify-between items-center shrink-0">
                     <div class="flex flex-col">
-                        <h1 class="text-xl font-black italic text-orange-400 uppercase tracking-tighter">Hafland OS</h1>
+                        <h1 class="text-xl font-black italic text-orange-400 uppercase tracking-tighter">Hafland Elite</h1>
                         <span class="status-bar">${chatName}</span>
                     </div>
                     <div class="glass px-3 py-1.5 rounded-xl flex items-center gap-2 border-orange-500/20">
@@ -271,19 +303,27 @@
                             ${s.activeChats.map(u => `<button onclick="openChat('${u.uid}')" class="shrink-0 glass p-2 px-4 rounded-xl ${s.chatMode===u.uid?'border-orange-500/50 text-orange-400':'text-gray-600'} font-black text-[9px] uppercase">${u.username}</button>`).join('')}
                         </div>
                         <div id="chat-box" class="chat-scroll overflow-y-auto space-y-4 no-scrollbar py-4">
-                            ${msgs.map(m => `
-                                <div class="msg-appear flex flex-col ${m.uid === s.user.uid ? 'items-end' : 'items-start'}">
-                                    ${isG ? `<span class="text-[7px] font-black text-gray-600 mb-1 uppercase">${m.sender} ${m.tag ? `[${m.tag}]` : ''}</span>` : ''}
-                                    <div class="${m.uid === s.user.uid ? 'btn-orange text-black' : (m.sender === 'SYSTEM' ? 'bg-orange-500/10 border border-orange-500/30 text-orange-200' : 'glass')} p-3 px-4 rounded-2xl text-[11px] max-w-[85%] font-medium">
-                                        ${m.text ? `<div>${m.text}</div>` : ''}
-                                        ${m.media ? `<div class="media-msg mt-2">
-                                            ${m.media.type === 'image' ? `<img src="${m.media.data}">` : ''}
-                                            ${m.media.type === 'video' ? `<video controls src="${m.media.data}"></video>` : ''}
-                                            ${m.media.type === 'audio' ? `<audio controls class="w-full h-8 mt-1"><source src="${m.media.data}" type="audio/ogg"></audio>` : ''}
-                                        </div>` : ''}
+                            ${msgs.map(m => {
+                                const senderData = s.users.find(u => u.uid === m.uid);
+                                const avatar = senderData?.avatar || m.avatar;
+                                return `
+                                <div class="msg-appear flex items-end gap-2 ${m.uid === s.user.uid ? 'flex-row-reverse' : 'flex-row'}">
+                                    <div class="w-6 h-6 rounded-full avatar-frame shrink-0 bg-orange-500/10 flex items-center justify-center text-[10px] font-black">
+                                        ${avatar ? `<img src="${avatar}" class="avatar-img">` : (m.sender?.[0] || 'S')}
+                                    </div>
+                                    <div class="flex flex-col ${m.uid === s.user.uid ? 'items-end' : 'items-start'} max-w-[80%]">
+                                        ${isG ? `<span class="text-[7px] font-black text-gray-600 mb-0.5 uppercase">${m.sender} ${m.tag ? `[${m.tag}]` : ''}</span>` : ''}
+                                        <div class="${m.uid === s.user.uid ? 'btn-orange text-black' : (m.sender === 'SYSTEM' ? 'bg-orange-500/10 border border-orange-500/30 text-orange-200' : 'glass')} p-3 px-4 rounded-2xl text-[11px] font-medium shadow-lg">
+                                            ${m.text ? `<div>${m.text}</div>` : ''}
+                                            ${m.media ? `<div class="media-msg mt-2">
+                                                ${m.media.type === 'image' ? `<img src="${m.media.data}">` : ''}
+                                                ${m.media.type === 'video' ? `<video controls src="${m.media.data}"></video>` : ''}
+                                                ${m.media.type === 'audio' ? `<audio controls class="w-full h-8 mt-1"><source src="${m.media.data}" type="audio/ogg"></audio>` : ''}
+                                            </div>` : ''}
+                                        </div>
                                     </div>
                                 </div>
-                            `).join('')}
+                            `}).join('')}
                         </div>
                         <div class="py-4 shrink-0 relative">
                             ${s.isMediaMenu ? `
@@ -293,19 +333,35 @@
                                     <button onclick="toggleVoiceRecord()" class="flex flex-col items-center gap-1 p-2 ${s.isRecording?'text-red-500':''}"><i data-lucide="mic" class="${s.isRecording?'text-red-500':'text-orange-400'}"></i><span class="text-[8px] uppercase font-black">${s.isRecording?'Stop':'Voice'}</span></button>
                                 </div>
                             ` : ''}
-                            <div class="glass flex p-2 rounded-2xl items-center">
+                            <div class="glass flex p-2 rounded-2xl items-center shadow-2xl">
                                 <button onclick="toggleMediaMenu()" class="w-10 h-10 flex items-center justify-center text-orange-400"><i data-lucide="${s.isMediaMenu?'x':'plus'}"></i></button>
-                                <input id="chat-input" class="flex-1 bg-transparent p-2 outline-none text-xs" placeholder="Message..." onkeypress="if(event.key==='Enter') sendMessage()">
+                                <input id="chat-input" class="flex-1 bg-transparent p-2 outline-none text-xs" placeholder="Type..." onkeypress="if(event.key==='Enter') sendMessage()">
                                 <button onclick="sendMessage()" class="btn-orange w-10 h-10 rounded-xl flex items-center justify-center"><i data-lucide="send" size="16"></i></button>
                             </div>
                         </div>
                     </div>
                 `;
             }
-            if(s.tab === 'network') return `<div class="p-6 space-y-4 h-full overflow-y-auto no-scrollbar">${s.users.map(u => `<div class="glass p-4 rounded-3xl flex items-center justify-between"><div class="flex items-center gap-4"><div class="w-10 h-10 bg-orange-500/10 rounded-2xl flex items-center justify-center text-orange-400 font-black">${u.username[0]}</div><div><div class="text-xs font-bold uppercase tracking-tight">${u.username}</div><div class="text-[8px] text-orange-500/50 uppercase font-black tracking-widest">${u.tag || 'ELITE MEMBER'}</div></div></div><div class="flex gap-2"><button onclick="window.state.selectedUserForGift = ${JSON.stringify(u).replace(/"/g, '&quot;')}; render()" class="text-orange-400 p-2"><i data-lucide="gift" size="18"></i></button><button onclick="openChat('${u.uid}')" class="text-orange-400 p-2"><i data-lucide="message-circle" size="18"></i></button></div></div>`).join('')}</div>`;
-            if(s.tab === 'terminal') return `<div class="h-full flex flex-col p-6 bg-black/40 font-mono"><div id="terminal-box" class="flex-1 overflow-y-auto text-[10px] space-y-1 text-orange-500/80 no-scrollbar">${s.terminalOutput.map(l => `<div>${l}</div>`).join('')}</div><div class="flex items-center gap-2 border-t border-orange-500/20 pt-4 mt-2 shrink-0"><span class="text-orange-500 font-bold">$</span><input id="terminal-input" class="flex-1 bg-transparent outline-none text-orange-500 text-xs" onkeypress="if(event.key==='Enter') runCommand()" placeholder="Elite command..."></div></div>`;
-            if(s.tab === 'market') return `<div class="p-6 space-y-4 h-full overflow-y-auto no-scrollbar"><div class="glass p-6 rounded-[2rem] flex justify-between items-center"><div><h3 class="font-black text-xs uppercase italic tracking-widest">NFT Engine</h3></div><button onclick="window.state.isMarketOverlay = 'nft_create'; render()" class="btn-orange px-5 py-2 rounded-xl text-[10px]">500 ★</button></div><div class="glass p-6 rounded-[2rem] flex justify-between items-center"><div><h3 class="font-black text-xs uppercase italic tracking-widest">Premium Core</h3></div><button onclick="alert('Coming Soon')" class="btn-orange px-5 py-2 rounded-xl text-[10px]">100 ★</button></div></div>`;
-            if(s.tab === 'profile') return `<div class="p-8 flex flex-col items-center h-full overflow-y-auto no-scrollbar"><div class="w-24 h-24 glass rounded-[2.5rem] flex items-center justify-center text-4xl font-black border-2 border-orange-500/20 shadow-2xl">${s.profile.username[0]}</div><h2 class="mt-6 text-2xl font-black uppercase italic tracking-tighter">${s.profile.username}</h2><div class="text-[10px] font-bold text-orange-500/50 uppercase tracking-[0.3em]">${s.profile.tag || 'ELITE MEMBER'}</div><div class="w-full mt-10 grid grid-cols-3 gap-3">${(s.profile.nfts || []).map(n => `<div class="aspect-square glass rounded-2xl overflow-hidden border border-white/5"><img src="${n.img}" class="w-full h-full object-cover"></div>`).join('')}</div></div>`;
+            if(s.tab === 'network') return `<div class="p-6 space-y-4 h-full overflow-y-auto no-scrollbar">${s.users.map(u => `<div class="glass p-4 rounded-3xl flex items-center justify-between"><div class="flex items-center gap-4"><div class="w-10 h-10 rounded-2xl avatar-frame flex items-center justify-center bg-orange-500/10 text-orange-400 font-black">${u.avatar ? `<img src="${u.avatar}" class="avatar-img">` : u.username[0]}</div><div><div class="text-xs font-bold uppercase tracking-tight">${u.username}</div><div class="text-[8px] text-orange-500/50 uppercase font-black tracking-widest">${u.tag || 'ELITE MEMBER'}</div></div></div><div class="flex gap-2"><button onclick="window.state.selectedUserForGift = ${JSON.stringify(u).replace(/"/g, '&quot;')}; render()" class="text-orange-400 p-2"><i data-lucide="gift" size="18"></i></button><button onclick="openChat('${u.uid}')" class="text-orange-400 p-2"><i data-lucide="message-circle" size="18"></i></button></div></div>`).join('')}</div>`;
+            if(s.tab === 'terminal') return `<div class="h-full flex flex-col p-6 bg-black/40 font-mono"><div id="terminal-box" class="flex-1 overflow-y-auto text-[10px] space-y-1 text-orange-500/80 no-scrollbar">${s.terminalOutput.map(l => `<div>${l}</div>`).join('')}</div><div class="flex items-center gap-2 border-t border-orange-500/20 pt-4 mt-2 shrink-0"><span class="text-orange-500 font-bold">$</span><input id="terminal-input" class="flex-1 bg-transparent outline-none text-orange-500 text-xs" onkeypress="if(event.key==='Enter') runCommand()" placeholder="Execute..."></div></div>`;
+            if(s.tab === 'market') return `<div class="p-6 space-y-4 h-full overflow-y-auto no-scrollbar"><div class="glass p-6 rounded-[2rem] flex justify-between items-center"><div><h3 class="font-black text-xs uppercase italic tracking-widest">NFT Engine</h3></div><button onclick="window.state.isMarketOverlay = 'nft_create'; render()" class="btn-orange px-5 py-2 rounded-xl text-[10px]">500 ★</button></div><div class="glass p-6 rounded-[2rem] flex justify-between items-center opacity-50"><div><h3 class="font-black text-xs uppercase italic tracking-widest">Premium Core</h3></div><button class="btn-orange px-5 py-2 rounded-xl text-[10px]">LOCKED</button></div></div>`;
+            if(s.tab === 'profile') return `
+                <div class="p-8 flex flex-col items-center h-full overflow-y-auto no-scrollbar">
+                    <div class="relative group">
+                        <div class="w-24 h-24 rounded-[2.5rem] avatar-frame flex items-center justify-center text-4xl font-black bg-orange-500/10 shadow-2xl">
+                            ${s.profile.avatar ? `<img src="${s.profile.avatar}" class="avatar-img">` : s.profile.username[0]}
+                        </div>
+                        <label class="absolute bottom-0 right-0 w-8 h-8 btn-orange rounded-full flex items-center justify-center cursor-pointer border-4 border-[#05070a]">
+                            <i data-lucide="camera" size="14"></i>
+                            <input type="file" class="hidden" accept="image/*" onchange="updateAvatar(event)">
+                        </label>
+                    </div>
+                    <h2 class="mt-6 text-2xl font-black uppercase italic tracking-tighter">${s.profile.username}</h2>
+                    <div class="text-[10px] font-bold text-orange-500/50 uppercase tracking-[0.3em] mb-8">${s.profile.tag || 'ELITE MEMBER'}</div>
+                    <div class="w-full grid grid-cols-3 gap-3">
+                        ${(s.profile.nfts || []).map(n => `<div class="aspect-square glass rounded-2xl overflow-hidden border border-white/5 shadow-xl"><img src="${n.img}" class="w-full h-full object-cover"></div>`).join('')}
+                    </div>
+                </div>`;
         }
 
         function renderOverlay() {
@@ -314,10 +370,10 @@
                 <div class="fixed inset-0 z-[100] glass flex items-center justify-center p-6">
                     <div class="bg-[#05070a] w-full max-w-xs rounded-[2.5rem] p-8 border border-orange-500/30 relative">
                         <button onclick="closeOverlay()" class="absolute top-6 right-6 text-gray-600"><i data-lucide="x"></i></button>
-                        <h3 class="text-center font-black mb-4 uppercase text-xs italic tracking-widest">Подарок для ${s.selectedUserForGift.username}</h3>
+                        <h3 class="text-center font-black mb-4 uppercase text-xs italic tracking-widest">Gift for ${s.selectedUserForGift.username}</h3>
                         <div class="space-y-4">
-                            <input type="number" oninput="window.state.giftAmount=this.value" value="${s.giftAmount}" class="w-full p-4 rounded-xl outline-none text-center text-orange-400 font-bold" placeholder="Количество звезд">
-                            <button onclick="sendStars()" class="w-full btn-orange p-4 rounded-xl text-xs uppercase font-black">Подарить звезды</button>
+                            <input type="number" oninput="window.state.giftAmount=this.value" value="${s.giftAmount}" class="w-full p-4 rounded-xl outline-none text-center text-orange-400 font-bold" placeholder="Stars">
+                            <button onclick="sendStars()" class="w-full btn-orange p-4 rounded-xl text-xs uppercase font-black">Transfer Stars</button>
                         </div>
                     </div>
                 </div>
@@ -327,8 +383,8 @@
                 <div class="fixed inset-0 z-[100] glass flex items-center justify-center p-6">
                     <div class="bg-[#05070a] w-full max-w-xs rounded-[2.5rem] p-8 border border-orange-500/30 relative shadow-2xl">
                         <button onclick="closeOverlay()" class="absolute top-6 right-6 text-gray-600"><i data-lucide="x"></i></button>
-                        ${s.isMarketOverlay === 'nft_create' ? `<h3 class="text-center font-black mb-6 uppercase text-xs italic tracking-widest">Создать NFT</h3><label class="w-full btn-orange p-4 rounded-xl text-xs uppercase cursor-pointer flex items-center justify-center gap-2"><i data-lucide="image" size="14"></i> Выбрать Фото<input type="file" class="hidden" accept="image/*" onchange="handleFileSelect(event)"></label>` : ''}
-                        ${s.isMarketOverlay === 'nft_send_list' ? `<h3 class="text-center font-black mb-4 uppercase text-[10px] italic tracking-widest text-orange-400">Кому подарить NFT?</h3><div class="flex justify-center mb-4"><img src="${s.nftTempImage}" class="w-20 h-20 object-cover rounded-xl border border-white/10 shadow-lg"></div><input oninput="window.state.searchQuery=this.value;render()" class="w-full p-4 rounded-xl outline-none mb-4 text-xs" placeholder="Поиск..."><div class="max-h-48 overflow-y-auto space-y-2 no-scrollbar">${s.users.filter(u => u.username.toLowerCase().includes(s.searchQuery.toLowerCase())).map(u => `<button onclick="sendNFT('${u.uid}')" class="w-full glass p-3 rounded-xl text-left text-xs font-bold flex justify-between items-center"><span>${u.username}</span><i data-lucide="send" size="14" class="text-orange-400"></i></button>`).join('')}</div>` : ''}
+                        ${s.isMarketOverlay === 'nft_create' ? `<h3 class="text-center font-black mb-6 uppercase text-xs italic tracking-widest">Create NFT</h3><label class="w-full btn-orange p-4 rounded-xl text-xs uppercase cursor-pointer flex items-center justify-center gap-2"><i data-lucide="image" size="14"></i> Load Image<input type="file" class="hidden" accept="image/*" onchange="handleFileSelect(event)"></label>` : ''}
+                        ${s.isMarketOverlay === 'nft_send_list' ? `<h3 class="text-center font-black mb-4 uppercase text-[10px] italic tracking-widest text-orange-400">Gift NFT To?</h3><div class="flex justify-center mb-4"><img src="${s.nftTempImage}" class="w-20 h-20 object-cover rounded-xl border border-white/10 shadow-lg"></div><input oninput="window.state.searchQuery=this.value;render()" class="w-full p-4 rounded-xl outline-none mb-4 text-xs" placeholder="Search..."><div class="max-h-48 overflow-y-auto space-y-2 no-scrollbar">${s.users.filter(u => u.username.toLowerCase().includes(s.searchQuery.toLowerCase())).map(u => `<button onclick="sendNFT('${u.uid}')" class="w-full glass p-3 rounded-xl text-left text-xs font-bold flex justify-between items-center"><span>${u.username}</span><i data-lucide="send" size="14" class="text-orange-400"></i></button>`).join('')}</div>` : ''}
                     </div>
                 </div>
             `;
@@ -348,5 +404,4 @@
     </script>
 </body>
 </html>
-
 
